@@ -81,6 +81,7 @@ go.work
 
 # IDE
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
