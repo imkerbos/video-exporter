@@ -1,0 +1,493 @@
+---
+alwaysApply: true
+---
+
+# Video Exporter – 全链路视频质量 & 网络指标增强.mdc
+
+## 背景与目标
+
+本仓库实现了一个 **视频质量监控 Exporter**：
+
+- 通过 **HTTP-FLV** 拉流（通常是：第三方 RTMP → SRS → HTTP-FLV）
+- 使用 **Joy5 FLV Demuxer** 解析视频数据包
+- 统计视频层质量指标（码率、帧率、关键帧、GOP、质量评分等）
+- 以 **Prometheus metrics** 暴露，供 Prometheus / Grafana 使用
+
+业务目标是构建一套 **全链路视频监控体系**：
+
+- 将链路拆分为 3 段：
+  - 视频源 → 视频服务（Source）
+  - 视频服务 → CDN（Service）
+  - CDN → 用户（CDN）
+- 按 **项目 / 桌台 / ID / 线路角色** 打标签
+- 快速定位：哪里不稳定、问题在哪一段、更偏向视频问题还是网络问题
+
+当前问题：
+
+1. Exporter 只有视频层质量指标，缺少网络层指标（连接耗时、读取吞吐、读阻塞等），无法区分“视频本身问题”还是“网络问题”
+2. 配置结构需要更好地表达业务含义：
+   streams -> 项目 -> 线路角色(CDN/SOURCE/...) -> {url,id,tag...}
+3. 超时控制和重试逻辑需要加强，避免上游卡死导致 goroutine 长时间阻塞
+4. 文档/示例没有充分体现“全链路 + 标签 + 网络指标”的使用方式
+
+本文件指导对本仓库进行以下改造：
+
+- 改造配置结构：支持 streams -> 项目 -> 线路角色 -> 流列表 + 自定义 tag
+- 扩展 StreamChecker：增加网络指标采集，完善超时控制
+- 扩展 Prometheus 指标：增加网络指标，统一 label 设计
+- 更新文档和示例：支持按“项目 + 桌台 + 线路角色”做全链路分析
+
+---
+
+## 代码入口与关键模块（请先定位）
+
+实际开发前，请在仓库中定位以下模块（名称可能略有差异，请以真实代码为准）：
+
+- 配置相关
+  - config.go / config/config.go
+  - 包含 Config、ExporterConfig、StreamConfig 定义与 LoadConfig 实现
+- 调度 / 周期检查
+  - scheduler.go / scheduler/ 目录
+  - 包含 Scheduler struct、Start()、runCheckCycle()、checkWithRetry()
+- 单路流检查与统计
+  - stream.go / stream_checker.go
+  - 包含：
+    - StreamChecker struct
+    - Check(timeout time.Duration) error 或类似方法
+    - FLV Demux 解析与视频质量统计（码率/帧率/关键帧/GOP/质量评分等）
+- HTTP 客户端
+  - initHTTPClient() / globalHTTPClient 相关初始化代码
+- Prometheus Exporter
+  - exporter.go / metrics.go
+  - Exporter struct、/metrics 路由注册、prometheus.NewGaugeVec / MustRegister 等
+
+---
+
+## 任务一：调整 streams 配置结构（项目 → 线路角色 → 流 + 自定义 tag）
+
+### 目标
+
+将配置结构调整为三层：
+
+streams:
+  G01:                  # 项目 / 厅 / 房间 ID
+    SOURCE:             # 线路角色（任意命名，如 SOURCE / SERVICE / CDN）
+      - url: http://srs-source/live/room01.flv
+        id: table-01
+        tag: source     # 简单 tag 写法（兼容）
+        tags:           # 推荐：自定义标签 map
+          table: table-01
+          desk: "01"
+          biz: baccarat
+
+    CDN:
+      - url: http://srs-cdn/live/room01.flv
+        id: table-01-cdn
+        tags:
+          table: table-01
+          line: cdn
+          isp: ct
+
+  G02:
+    SOURCE:
+      - url: http://srs-source/live/room02.flv
+        id: table-02
+        tags:
+          table: table-02
+          desk: "02"
+
+语义说明：
+
+- 第一层 key：项目 / 厅（例如 G01、G02），映射为 Prometheus label：project
+- 第二层 key：线路角色 / 分组（例如 SOURCE / SERVICE / CDN），映射为 label：line（小写）
+- 第三层：具体流对象 {url,id,tag,tags...}，id 通常对应桌台 ID 或内部唯一标识
+- 支持：
+  - tag: xxx 简单写法（向后兼容）
+  - tags: {k:v} map 用于自定义业务标签（桌台、游戏类型、运营商等）
+
+### Config 结构建议
+
+type Config struct {
+    Exporter ExporterConfig                       `yaml:"exporter"`
+    Streams  map[string]map[string][]StreamConfig `yaml:"streams"`
+    // 第一层 key: 项目，例如 "G01"
+    // 第二层 key: 线路角色/分组，例如 "SOURCE" / "CDN"
+    // 第三层: 流列表
+}
+
+type StreamConfig struct {
+    URL  string            `yaml:"url"`
+    ID   string            `yaml:"id"`
+    Tag  string            `yaml:"tag,omitempty"`   // 简单 tag 写法
+    Tags map[string]string `yaml:"tags,omitempty"`  // 推荐：自定义标签
+}
+
+### 加载逻辑要求（伪代码）
+
+在 LoadConfig（或等价函数）中，将三层结构展开为内部流对象，并构造统一标签 map：
+
+for projectID, groups := range cfg.Streams {
+    for groupName, streamList := range groups {
+        line := strings.ToLower(groupName) // eg. "source" / "cdn" / "service"
+
+        for _, sc := range streamList {
+            tags := map[string]string{}
+            // 合并 tags map
+            for k, v := range sc.Tags {
+                tags[k] = v
+            }
+            // 兼容 tag 字段
+            if sc.Tag != "" {
+                if _, exists := tags["tag"]; !exists {
+                    tags["tag"] = sc.Tag
+                }
+            }
+
+            // 系统固定标签
+            tags["project"] = projectID
+            tags["line"] = line
+            tags["id"] = sc.ID
+
+            // 创建 StreamChecker / 注册到 Scheduler
+            checker := NewStreamChecker(sc.URL, sc.ID, projectID, line, tags, logger)
+            scheduler.AddChecker(checker)
+        }
+    }
+}
+
+### StreamChecker / Metrics 中存储标签
+
+建议更新 StreamChecker 定义，增加项目/线路/标签字段，例如：
+
+type StreamChecker struct {
+    ID      string
+    URL     string
+    Project string
+    Line    string            // source / service / cdn
+    Labels  map[string]string // project/line/id + 自定义 tags
+    // ...
+}
+
+导出 Prometheus 指标时，从 Labels 中构建 label 组合（具体白名单逻辑见「任务四」）。
+
+---
+
+## 任务二：在 StreamChecker 中增加网络指标采集
+
+### 目标
+
+在现有视频质量采样基础上，为每次采样周期增加以下网络层指标：
+
+- 连接/首包延迟：
+  - connect_latency_ms：HTTP 连接建立耗时（包含 TCP/TLS）
+  - ttfb_ms：首字节时间（Time To First Byte）
+- 读取吞吐：
+  - read_throughput_bps：采样期间平均读取吞吐（bit/s）
+- 读取阻塞（Read Stall）：
+  - read_stall_count：单次读取阻塞超过阈值的次数（如 >200ms）
+  - read_stall_max_ms：最长一次 stall 的时长
+  - （可选）read_stall_total_ms：所有 stall 的合计时长
+
+### 实现细节要求
+
+1. 连接/首包延迟
+
+在 StreamChecker.Check(timeout) 内：
+
+reqStart := time.Now()
+resp, err := client.Do(req)
+connectLatency := time.Since(reqStart)
+
+首字节时间：
+
+- 在第一次读取数据前记录起点；
+- 第一次成功读取数据后，记录 ttfb := time.Since(reqStart)；
+- 若使用 Demuxer，可在第一次 ReadPacket() 成功后认为首包到达。
+
+2. 读取吞吐与读阻塞（stall）
+
+在读取循环中（可以在 Demuxer 底层或包级循环中实现）：
+
+var (
+    totalBytes int64
+    stallCount int64
+    maxStall   time.Duration
+    totalStall time.Duration
+)
+
+for {
+    readStart := time.Now()
+    n, err := resp.Body.Read(buf)
+    elapsed := time.Since(readStart)
+
+    if elapsed > stallThreshold { // 例如 200ms，可通过配置
+        stallCount++
+        if elapsed > maxStall {
+            maxStall = elapsed
+        }
+        totalStall += elapsed
+    }
+
+    if n > 0 {
+        totalBytes += int64(n)
+    }
+
+    // 现有逻辑：使用 Demuxer 解析 FLV packet，统计视频层指标
+}
+
+在采样结束时，根据采样时长（基于 DTS 时间跨度或 Check 内部 wall clock）计算：
+
+readThroughputBps := float64(totalBytes*8) / sampleDurationSeconds
+
+3. 字段存储
+
+在 StreamChecker 中增加字段：
+
+type StreamChecker struct {
+    // ...
+    ConnectLatencyMs   float64
+    TTFBMs             float64
+    ReadThroughputBps  float64
+    ReadStallCount     int64
+    ReadStallMaxMs     float64
+    ReadStallTotalMs   float64
+    // ...
+}
+
+采样完成后，使用 mu.Lock() 更新以上字段。
+
+---
+
+## 任务三：完善超时控制 & 调度重试逻辑
+
+### 目标
+
+确保对每个流的检查在可控时间内结束，避免上游卡死导致 goroutine 卡死，同时配合重试机制：
+
+- 短暂网络抖动可通过重试恢复；
+- 持续性问题在合理次数重试后标记失败，不拖垮整个检查周期。
+
+### 实现要求
+
+1. 调度层计算 timeout 并传入 Check
+
+确认 Scheduler.checkWithRetry() 中存在 timeout 计算逻辑，并确保调用：
+
+err := checker.Check(timeout)
+
+2. Check 中使用 context.WithTimeout
+
+在 Check(timeout) 中使用带超时的 context：
+
+ctx, cancel := context.WithTimeout(context.Background(), timeout)
+defer cancel()
+
+req, err := http.NewRequestWithContext(ctx, "GET", sc.URL, nil)
+resp, err := globalHTTPClient.Do(req)
+
+当 context 超时时，Do() 和后续读取应返回 error，而不是无限阻塞。
+
+3. 错误与重试处理
+
+- 对 context deadline exceeded 等超时错误，统一视为网络级失败，交由 checkWithRetry() 重试；
+- 重试间隔可使用指数退避（例如 2s / 4s / 8s），上限由配置 MaxRetries 控制；
+- 在所有重试失败后，调用 checker.MarkFailed() 并正确更新健康状态指标。
+
+---
+
+## 任务四：扩展 Prometheus 指标（网络 + 全链路标签）
+
+### 目标
+
+在现有视频层指标基础上，新增网络相关指标，并统一 Prometheus label 设计，使后续可以按「项目 + 线路角色 + 桌台/业务标签」做聚合分析与报表。
+
+### 新增网络指标建议
+
+- video_stream_connect_latency_ms（gauge）
+- video_stream_ttfb_ms（gauge）
+- video_stream_read_throughput_bps（gauge）
+- video_stream_read_stall_count（gauge）
+- video_stream_read_stall_max_ms（gauge）
+- video_stream_read_stall_total_ms（gauge，可选）
+
+### 已有视频层指标（保持）
+
+例如：
+
+- video_stream_up
+- video_stream_playable
+- video_stream_quality_score
+- video_stream_stability_score
+- video_stream_bitrate_bps
+- video_stream_framerate
+- video_stream_gop_size
+- video_stream_response_ms
+
+### label 设计要求
+
+所有指标统一使用以下 label 集合（其中一部分来自配置中的 tags）：
+
+- 必选：
+  - project：项目/厅 ID（streams 第一层 key）
+  - line：线路角色（streams 第二层 key 小写：source / service / cdn 等）
+  - id：流/桌台 ID（配置中的 id 字段）
+- 可选：从 Labels/tags 中筛选的业务标签（建议 whitelist），例如：
+  - table
+  - desk
+  - biz
+  - isp
+  - line_type
+
+建议使用白名单控制自定义 tags 进入 Prometheus label，例如：
+
+var allowedTagKeys = map[string]struct{}{
+    "table": {},
+    "desk":  {},
+    "biz":   {},
+    "isp":   {},
+    "line":  {},
+}
+
+在构造 Prometheus label 时：
+
+- 基于 StreamChecker.Labels 初始化 label map；
+- 将非 allowedTagKeys 且非基础 key（project/line/id）过滤掉。
+
+目标形态示例：
+
+video_stream_bitrate_bps{
+  project="G01",
+  line="cdn",
+  id="table-01-cdn",
+  table="table-01",
+  isp="ct"
+} 1500000
+
+video_stream_read_stall_count{
+  project="G01",
+  line="source",
+  id="table-01",
+  table="table-01",
+  biz="baccarat"
+} 0
+
+---
+
+## 任务五：文档 & 配置示例更新（全链路视角）
+
+### 目标
+
+通过 README / 示例配置，让使用者清楚理解：
+
+- 如何使用新的三层 streams 配置结构来描述 项目 + 三段链路
+- 新增网络指标的含义
+- 在 Prometheus / Grafana 中如何使用这些指标进行全链路分析
+
+### 建议内容
+
+1. 配置示例
+
+在 README 或 config.example.yaml 中，增加一个完整的全链路示例：
+
+streams:
+  G01:
+    SOURCE:
+      - url: http://srs-source/live/room01.flv
+        id: table-01
+        tags:
+          table: table-01
+          biz: baccarat
+
+    SERVICE:
+      - url: http://srs-service/live/room01.flv
+        id: table-01-svc
+        tags:
+          table: table-01
+          biz: baccarat
+
+    CDN:
+      - url: http://srs-cdn/live/room01.flv
+        id: table-01-cdn
+        tags:
+          table: table-01
+          biz: baccarat
+          isp: ct
+
+说明：
+
+- G01 是某个项目/厅
+- 三个线路角色：SOURCE / SERVICE / CDN 对应链路三段
+- 同一桌台 table-01 在三段中有不同 id，用于区分不同监控点
+
+2. 网络指标说明
+
+在 README 中新增章节，简要说明：
+
+- video_stream_connect_latency_ms：连接建立耗时，过高可能为网络或服务端响应慢
+- video_stream_ttfb_ms：首字节时间，结合 connect latency 可判断服务器处理时长
+- video_stream_read_throughput_bps：采样期间平均读取吞吐，与视频码率差异可反映网络瓶颈
+- video_stream_read_stall_*：读取阻塞情况，常用于判定网络抖动引起的卡顿
+
+3. 简单 PromQL 示例（文档中展示用）
+
+例如：
+
+- 按线路角色统计某项目过去 1 小时的平均质量评分：
+
+  avg_over_time(video_stream_quality_score{project="G01"}[1h]) by (line)
+
+- 按桌台和线路角色统计 read stall 次数：
+
+  sum_over_time(video_stream_read_stall_count{project="G01", table="table-01"}[1h]) by (line)
+
+---
+
+## 任务六：基础测试与验证
+
+### 目标
+
+在典型场景下验证新逻辑的稳定性与正确性，包括：
+
+- 正常流场景
+- 故意引入网络抖动/限速
+- 上游卡死/超时
+
+### 建议测试场景
+
+1. 正常流（无明显网络问题）
+
+- 网络延迟低，吞吐稳定，丢包少
+- 预期：
+  - read_stall_count 接近 0
+  - read_throughput_bps 与视频码率接近
+  - quality_score 整体较高（good/fair）
+
+2. 模拟网络抖动/限速
+
+- 对某条 HTTP-FLV 流施加限速或高延迟（例如 tc 或网关规则）
+- 预期：
+  - read_stall_count / read_stall_max_ms / read_stall_total_ms 明显升高
+  - 视频层指标（bitrate/framerate/quality_score）出现劣化
+  - 在 Grafana 中可以看到「网络 stall 增加 → 视频质量下降」的时间相关性
+
+3. 上游卡死/超时
+
+- 模拟 SRS 或中间服务不响应或 read 阻塞
+- 预期：
+  - Check(timeout) 在指定 timeout 内退出，并返回 error
+  - checkWithRetry() 按配置进行重试，最终标记流为失败状态
+  - 程序无 goroutine 泄漏 / 死锁，内存不异常增长
+
+---
+
+## 风格与输出要求
+
+- 新增/修改的 Go 代码应：
+  - 遵循本仓库现有代码风格
+  - 通过 go vet / linter / CI（如项目中已有）
+- 所有对外暴露的配置字段、结构体字段、Prometheus 指标：
+  - 必须有简短清晰的注释（说明语义、单位与典型用途）
+- README / 示例：
+  - 聚焦“结果导向”的业务价值：
+    - 能回答“视频稳不稳”、“哪一段链路有问题”、“更偏网络还是视频本身”
+  - 避免过度堆砌技术细节，更多从“项目/桌台/链路”的视角组织示例和说明。

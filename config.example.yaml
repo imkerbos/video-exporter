@@ -1,0 +1,70 @@
+# Video Exporter 配置文件示例
+
+exporter:
+  check_interval: 30    # 健康检查间隔（秒）
+  sample_duration: 10   # 流采样时长（秒），每次检查采样多少秒的数据
+  min_keyframes: 2      # 最小关键帧数，采样到这么多关键帧后可提前结束
+  max_concurrent: 1000  # 最大并发监控数
+  max_retries: 3        # 连接失败最大重试次数（使用指数退避：2s, 4s, 8s...）
+  stall_threshold_ms: 200  # 读阻塞阈值（毫秒），超过此时间的单次读取视为阻塞，默认200ms
+  listen_addr: "8080"   # Prometheus exporter 监听地址（端口或 :端口）
+  log_level: "info"     # 日志级别：debug, info, warn, error
+
+# 监控的流列表（三层结构：项目 -> 线路角色 -> 流列表）
+# 第一层 key: 项目/店铺 ID（例如 G01, G02）
+# 第二层 key: 线路角色/分组（例如 SOURCE, SERVICE, CDN）
+# 第三层: 流配置列表
+streams:
+  # 项目 G01 - 全链路监控示例
+  G01:
+    # 视频源 -> 视频服务（Source 段）
+    SOURCE:
+      - url: http://srs-source/live/room01.flv
+        id: store-01
+        tags:
+          table: store-01
+          desk: "01"
+          biz: electronics
+
+    # 视频服务 -> CDN（Service 段）
+    SERVICE:
+      - url: http://srs-service/live/room01.flv
+        id: store-01-svc
+        tags:
+          table: store-01
+          biz: electronics
+
+    # CDN -> 用户（CDN 段）
+    CDN:
+      - url: http://srs-cdn/live/room01.flv
+        id: store-01-cdn
+        tags:
+          table: store-01
+          biz: electronics
+          isp: ct
+
+  # 项目 G02 - 简单配置示例
+  G02:
+    SOURCE:
+      - url: http://srs-source/live/room02.flv
+        id: store-02
+        tag: source     # 简单 tag 写法（向后兼容）
+        tags:           # 推荐使用 tags map
+          table: store-02
+          desk: "02"
+
+# 配置说明：
+# 1. check_interval: 建议设置为 20-60 秒
+# 2. sample_duration: 每次检查采样的时长，建议 5-15 秒，时间越长指标越准确但检查越慢
+# 3. min_keyframes: 最小关键帧数，采样到足够关键帧后可提前结束，建议 2-5
+# 4. max_concurrent: 根据服务器性能设置，建议 100-1000
+# 5. max_retries: 连接失败重试次数，使用指数退避（2s, 4s, 8s...），建议 3-5 次
+# 6. 线路角色（第二层 key）会转为小写作为 Prometheus label "line"
+# 7. tags 中的键如果不在白名单中，不会进入 Prometheus label（白名单：table, desk, biz, isp, role）
+#    标签语义说明：
+#      - table: 店铺编号（推荐使用）
+#      - desk: 柜台编号（可选）
+#      - biz: 商品类别（electronics/clothing/food等，推荐使用）
+#      - isp: 运营商（ct/cm/cu，推荐使用）
+#      - role: 角色/用途标识（例如 test/prod，可选）
+# 8. 支持的流格式: HTTP-FLV（推荐）, RTMP, HLS, RTSP 等

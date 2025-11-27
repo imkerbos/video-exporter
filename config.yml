@@ -1,0 +1,21 @@
+exporter:
+  check_interval: 30    # 健康检查间隔（秒）
+  sample_duration: 10   # 流采样时长（秒），每次检查采样多少秒的数据
+  min_keyframes: 2      # 最小关键帧数，采样到这么多关键帧后可提前结束
+  max_concurrent: 1000  # 最大并发监控数
+  max_retries: 3        # 连接失败最大重试次数（使用指数退避：2s, 4s, 8s...）
+  stall_threshold_ms: 200  # 读阻塞阈值（毫秒），超过此时间的单次读取视为阻塞，默认200ms
+  listen_addr: "9100"   # Prometheus exporter 监听地址（端口或 :端口）
+  log_level: "info"     # 日志级别：debug, info, warn, error
+
+streams:
+  G01:
+    CDN:
+    - url: https://bt-eu2.gdgazx.com/PT/102367.flv
+      id: P008
+      tags:
+        role: test
+    - url: https://cn-eu2.0476dy2.com/PT/102367.flv
+      id: P008
+      tags:
+        role: test
