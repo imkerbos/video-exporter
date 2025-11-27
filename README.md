@@ -38,9 +38,12 @@ sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev pkg-config
 exporter:
   check_interval: 30    # 检查间隔（秒）
   sample_duration: 10   # 采样时长（秒）
+  min_keyframes: 2      # 最小关键帧数
   max_concurrent: 1000  # 最大并发数
   max_retries: 3        # 最大重试次数（指数退避）
+  stall_threshold_ms: 200  # 读阻塞阈值（毫秒），超过此时间的单次读取视为阻塞
   listen_addr: "8080"   # Prometheus 监听端口
+  log_level: "info"     # 日志级别：debug, info, warn, error
 
 # 三层结构：项目 -> 线路角色 -> 流列表
 streams:
@@ -65,7 +68,7 @@ streams:
 - **第一层**（项目）：项目/店铺 ID，映射为 Prometheus label `project`
 - **第二层**（线路角色）：SOURCE / SERVICE / CDN 等，映射为 label `line`（小写）
 - **第三层**（流配置）：`url`（流地址）、`id`（流ID）、`tags`（自定义标签）
-- **自定义标签**：支持 `table`（店铺）、`desk`（柜台）、`biz`（商品类别）、`isp` 等业务标签（白名单控制）
+- **自定义标签**：支持 `table`（店铺）、`desk`（柜台）、`biz`（商品类别）、`isp`（运营商）、`role`（角色/用途标识）等业务标签（白名单控制）
 
 ### 3. 运行
 
@@ -148,9 +151,9 @@ video_stream_read_stall_max_ms{project="G01",line="cdn",id="store-01-cdn"} 350.0
   - 0=poor, 1=fair, 2=good
 - **稳定性评分** (`video_stream_stability_score`): stable/moderate/unstable（基于码率变异系数）
   - 0=unstable, 1=moderate, 2=stable
-- **综合评分** (`video_stream_overall_score`): 综合考虑视频质量和网络稳定性
-  - 使用离散等级 + 显式映射，更清晰直观
-  - 映射规则：
+- **综合评分** (`video_stream_overall_score`): 综合考虑视频质量、稳定性和网络卡顿情况
+  - **硬性卡顿判定**：如果 `read_stall_ratio > 0.5`（阻塞时间占比超过 50%），无论质量和稳定性如何，强制为 0（poor）
+  - 在未触发硬性卡顿判定的情况下，使用离散等级 + 显式映射：
     - `(2,2)` → 2 (excellent: 质量好且稳定)
     - `(2,1)` → 1 (good: 质量好但稳定性中等)
     - `(2,0)` → 0 (poor: 质量好但不稳定，网络抖动严重)
@@ -170,9 +173,12 @@ video_stream_read_stall_max_ms{project="G01",line="cdn",id="store-01-cdn"} 350.0
 - **读取吞吐** (`video_stream_read_throughput_bps`): 采样期间平均读取吞吐，单位：bps
   - 与视频码率差异可反映网络瓶颈
 - **读阻塞统计**:
-  - `video_stream_read_stall_count`: 单次读取阻塞超过 200ms 的次数
+  - `video_stream_read_stall_count`: 单次读取阻塞超过阈值的次数（默认阈值 200ms，可通过 `stall_threshold_ms` 配置）
   - `video_stream_read_stall_max_ms`: 最长一次阻塞的时长（毫秒）
   - `video_stream_read_stall_total_ms`: 所有阻塞的合计时长（毫秒）
+  - `video_stream_read_stall_ratio`: 阻塞时间占总采样时长的比例（0~1），值越高表示网络抖动越严重
+    - **告警建议**：`read_stall_ratio > 0.5` 表示超过 50% 时间在阻塞，严重影响体验
+    - 在 `overall_score` 计算中，如果 `read_stall_ratio > 0.5`，会强制将综合评分设为 0（poor）
   - 常用于判定网络抖动引起的卡顿
 
 ### 健康评估
@@ -198,9 +204,13 @@ video_stream_read_stall_max_ms{project="G01",line="cdn",id="store-01-cdn"} 350.0
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | check_interval | 健康检查间隔（秒） | 30 |
+| sample_duration | 采样时长（秒） | 10 |
+| min_keyframes | 最小关键帧数 | 2 |
 | max_concurrent | 最大并发监控数 | 1000 |
 | max_retries | 连接失败最大重试次数 | 3 |
+| stall_threshold_ms | 读阻塞阈值（毫秒） | 200 |
 | listen_addr | Prometheus 监听端口 | 8080 |
+| log_level | 日志级别（debug/info/warn/error） | info |
 
 ## 支持的流格式
 
