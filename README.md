@@ -332,9 +332,9 @@ count(video_stream_ttfb_ms{project="G01"} > 500) / count(video_stream_ttfb_ms{pr
 avg_over_time(video_stream_overall_score{project="G01"}[1h]) by (biz, line)
 ```
 
-**对比各段链路的网络延迟：**
+**对比各段链路的响应时间：**
 ```promql
-avg_over_time(video_stream_connect_latency_ms{project="G01"}[5m]) by (line)
+avg_over_time(video_stream_response_ms{project="G01"}[5m]) by (line)
 ```
 
 **找出读阻塞最严重的流：**
