@@ -1,33 +1,40 @@
 # Video Exporter
 
-基于 FFmpeg 的视频流监控导出系统，用于实时监控直播流的健康状况和质量指标。
+基于 Go 和 joy5 库的视频流监控导出系统，用于实时监控直播流的健康状况和质量指标。通过 HTTP-FLV 拉流，使用纯 Go 实现，无需外部依赖。
 
 ## 功能特性
 
 - ✅ 实时流监控（多协程并发）
 - ✅ 深度质量分析（码率、帧率、分辨率、GOP等）
-- ✅ **网络指标采集**（连接延迟、TTFB、读取吞吐、读阻塞）
+- ✅ **网络指标采集**（HTTP 响应时间、TTFB、读取吞吐、读阻塞统计）
 - ✅ 健康评估系统（可播放性、质量等级）
 - ✅ **全链路监控**（支持项目 → 线路角色 → 流的三层结构）
 - ✅ **自定义标签**（支持按店铺、商品类别等打标签）
 - ✅ 自动重连机制（指数退避）
 - ✅ 超时控制（避免上游卡死）
-- ✅ 支持多种流格式（HTTP-FLV、RTMP、HLS、RTSP等）
+- ✅ 支持 HTTP-FLV 流格式（基于 joy5 库，纯 Go 实现）
 - ✅ Prometheus 指标导出
 - ✅ 结构化日志输出
 
 ## 快速开始
 
-### 1. 安装 FFmpeg
+### 1. 安装 Go
+
+确保已安装 Go 1.24 或更高版本：
 
 **macOS:**
 ```bash
-brew install ffmpeg pkg-config
+brew install go
 ```
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev pkg-config
+sudo apt-get install -y golang-go
+```
+
+**验证安装：**
+```bash
+go version
 ```
 
 ### 2. 配置流地址
@@ -130,11 +137,12 @@ video_stream_framerate{project="G01",line="source",id="store-01"} 25.0
 
 **网络指标示例：**
 ```
-video_stream_connect_latency_ms{project="G01",line="source",id="store-01"} 45.2
-video_stream_ttfb_ms{project="G01",line="source",id="store-01"} 120.5
+video_stream_response_ms{project="G01",line="source",id="store-01"} 624.0
+video_stream_ttfb_ms{project="G01",line="source",id="store-01"} 624.5
 video_stream_read_throughput_bps{project="G01",line="cdn",id="store-01-cdn"} 1800000.0
 video_stream_read_stall_count{project="G01",line="cdn",id="store-01-cdn"} 2
 video_stream_read_stall_max_ms{project="G01",line="cdn",id="store-01-cdn"} 350.0
+video_stream_read_stall_ratio{project="G01",line="cdn",id="store-01-cdn"} 0.15
 ```
 
 ## 监控指标
@@ -214,11 +222,8 @@ video_stream_read_stall_max_ms{project="G01",line="cdn",id="store-01-cdn"} 350.0
 
 ## 支持的流格式
 
-- FLV / HTTP-FLV
-- RTMP / RTMPS
-- HLS (m3u8)
-- RTSP
-- 其他 FFmpeg 支持的格式
+- **HTTP-FLV**（主要支持）：通过 HTTP 拉取 FLV 流，使用 joy5 库解析
+- **其他格式**：当前版本主要支持 HTTP-FLV 格式。如需支持其他格式（RTMP、HLS、RTSP 等），需要扩展代码实现相应的协议解析
 
 ## 性能
 
@@ -360,10 +365,15 @@ video_stream_read_throughput_bps / video_stream_bitrate_bps
   expr: video_stream_read_stall_count > 5
   for: 1m
 
-# 连接延迟过高告警
-- alert: HighConnectLatency
-  expr: video_stream_connect_latency_ms > 1000
+# 首字节时间过长告警
+- alert: HighTTFB
+  expr: video_stream_ttfb_ms > 1000
   for: 2m
+
+# 阻塞占比过高告警
+- alert: HighStallRatio
+  expr: video_stream_read_stall_ratio > 0.5
+  for: 1m
 
 # 响应过慢告警
 - alert: SlowResponse

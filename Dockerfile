@@ -44,8 +44,8 @@ FROM alpine:3.20
 
 WORKDIR /app
 
-# Minimal runtime deps: CA certs and ffmpeg (per project README)
-RUN apk add --no-cache ca-certificates ffmpeg
+# Minimal runtime deps: CA certs only (pure Go implementation, no external dependencies)
+RUN apk add --no-cache ca-certificates
 
 # Copy binary
 COPY --from=builder /bin/video-exporter /usr/local/bin/video-exporter
